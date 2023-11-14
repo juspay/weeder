@@ -105,7 +105,7 @@ main = do
 -- This will recursively find all files with the given extension in the given directories, perform
 -- analysis, and report all unused definitions according to the 'Config'.
 mainWithConfig :: String -> [FilePath] -> Bool -> Config -> IO ()
-mainWithConfig hieExt hieDirectories requireHsFiles Config{ rootPatterns, typeClassRoots } = do
+mainWithConfig hieExt hieDirectories requireHsFiles weederConfig@Config{ rootPatterns, typeClassRoots } = do
   hieFilePaths <-
     concat <$>
       traverse ( getFilesIn hieExt )
@@ -122,14 +122,15 @@ mainWithConfig hieExt hieDirectories requireHsFiles Config{ rootPatterns, typeCl
   nameCache <- do
     uniqSupply <- mkSplitUniqSupply 'z'
     return ( initNameCache uniqSupply [] )
-
+  hieFileResults <-
+    mapM ( readCompatibleHieFileOrExit nameCache ) hieFilePaths
+  let
+    hieFileResults' = flip filter hieFileResults \hieFileResult ->
+      let hsFileExists = any ( hie_hs_file hieFileResult `isSuffixOf` ) hsFilePaths
+       in requireHsFiles ==> hsFileExists
   analysis <-
-    flip execStateT emptyAnalysis do
-      for_ hieFilePaths \hieFilePath -> do
-        hieFileResult <- liftIO ( readCompatibleHieFileOrExit nameCache hieFilePath )
-        let hsFileExists = any ( hie_hs_file hieFileResult `isSuffixOf` ) hsFilePaths
-        when (requireHsFiles ==> hsFileExists) do
-          analyseHieFile hieFileResult
+    execStateT ( analyseHieFiles weederConfig hieFileResults' ) emptyAnalysis
+
 
   let
     roots =

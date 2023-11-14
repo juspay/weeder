@@ -7,11 +7,12 @@
 {-# language NoImplicitPrelude #-}
 {-# language OverloadedLabels #-}
 {-# language OverloadedStrings #-}
+{-# language TupleSections #-}
 
 module Weeder
   ( -- * Analysis
     Analysis(..)
-  , analyseHieFile
+  , analyseHieFiles
   , emptyAnalysis
   , allDeclarations
 
@@ -55,11 +56,19 @@ import HieTypes
   , ContextInfo( Decl, ValBind, PatternBind, Use, TyDecl, ClassTyDecl )
   , DeclType( DataDec, ClassDec, ConDec )
   , HieAST( Node, nodeInfo, nodeChildren, nodeSpan )
-  , HieASTs( HieASTs )
+  , HieASTs( HieASTs, getAsts )
   , HieFile( HieFile, hie_asts, hie_exports, hie_module, hie_hs_file )
   , IdentifierDetails( IdentifierDetails, identInfo )
   , NodeInfo( NodeInfo, nodeIdentifiers, nodeAnnotations )
   , Scope( ModuleScope )
+  , IdentifierDetails( IdentifierDetails, identInfo, identType )
+  , TypeIndex
+  , HieTypeFix( Roll )
+  , HieArgs( HieArgs )
+  , HieType( HTyVarTy, HAppTy, HTyConApp, HForAllTy, HFunTy, HQualTy, HLitTy, HCastTy, HCoercionTy )
+  , Span
+  , Identifier
+  , HieFile( HieFile, hie_asts, hie_exports, hie_module, hie_hs_file, hie_types )
   )
 import Module ( Module, moduleStableString )
 import Name ( Name, nameModule_maybe, nameOccName )
@@ -73,16 +82,23 @@ import OccName
   , occNameString
   )
 import SrcLoc ( RealSrcSpan, realSrcSpanEnd, realSrcSpanStart )
-
+import IfaceType
+  ( ShowForAllFlag (ShowForAllWhen)
+  , pprIfaceSigmaType
+  , IfaceTyCon (IfaceTyCon, ifaceTyConName)
+  )
 -- lens
 import Control.Lens ( (%=) )
-
+import qualified Data.Map as M
 -- mtl
 import Control.Monad.State.Class ( MonadState )
 
 -- transformers
 import Control.Monad.Trans.Maybe ( runMaybeT )
-
+import Weeder.Config ( Config( Config, typeClassRoots, unusedTypes ) )
+import Control.Monad.Reader.Class ( MonadReader, asks, ask)
+import HieUtils
+import Control.Monad.Trans.Reader ( runReaderT )
 
 data Declaration =
   Declaration
@@ -138,7 +154,13 @@ data Analysis =
     }
   deriving
     ( Generic )
-
+type RefMap a = M.Map Identifier [(Span, IdentifierDetails a)]
+data AnalysisInfo =
+  AnalysisInfo
+    { currentHieFile :: HieFile
+    , weederConfig :: Config
+    , refMap :: RefMap TypeIndex
+    }
 
 -- | The empty analysis - the result of analysing zero @.hie@ files.
 emptyAnalysis :: Analysis
@@ -172,10 +194,22 @@ allDeclarations :: Analysis -> Set Declaration
 allDeclarations Analysis{ dependencyGraph } =
   Set.fromList ( vertexList dependencyGraph )
 
+analyseHieFiles :: (Foldable f, MonadState Analysis m) => Config -> f HieFile -> m ()
+analyseHieFiles weederConfig hieFiles = do
+  for_ hieFiles \hieFile -> do
+    let info = AnalysisInfo hieFile weederConfig rf
+    runReaderT analyseHieFile info
+
+  where
+
+    asts = concatMap (Map.elems . getAsts . hie_asts) hieFiles
+
+    rf = generateReferencesMap asts
 
 -- | Incrementally update 'Analysis' with information in a 'HieFile'.
-analyseHieFile :: MonadState Analysis m => HieFile -> m ()
-analyseHieFile HieFile{ hie_asts = HieASTs hieASTs, hie_exports, hie_module, hie_hs_file } = do
+analyseHieFile :: ( MonadState Analysis m, MonadReader AnalysisInfo m ) => m ()
+analyseHieFile = do
+  HieFile{ hie_asts = HieASTs hieASTs, hie_exports, hie_module, hie_hs_file } <- asks currentHieFile
   #modulePaths %= Map.insert hie_module hie_hs_file
 
   for_ hieASTs \ast -> do
@@ -226,12 +260,51 @@ addDeclaration decl =
 
 -- | Try and add vertices for all declarations in an AST - both
 -- those declared here, and those referred to from here.
-addAllDeclarations :: ( MonadState Analysis m ) => HieAST a -> m ()
-addAllDeclarations n@Node{ nodeChildren } = do
-  for_ ( findIdentifiers ( const True ) n ) addDeclaration
+addAllDeclarations :: ( MonadState Analysis m, MonadReader AnalysisInfo m ) => HieAST TypeIndex -> m ()
+addAllDeclarations n = do
+  Config{ unusedTypes } <- asks weederConfig
+  for_ ( findIdentifiers' ( const True ) n )
+    \(d, IdentifierDetails{ identType },_) -> do
+      addDeclaration d
+      when unusedTypes $
+        case identType of
+          Just t -> do
+            hieType <- lookupType t
+            let names = typeToNames hieType
+            traverse_ (traverse_ (addDependency d) . nameToDeclaration) names
+          Nothing -> pure ()
 
-  for_ nodeChildren addAllDeclarations
+typeToNames :: HieTypeFix -> Set Name
+typeToNames (Roll t) = case t of
+  HTyVarTy n -> Set.singleton n
 
+  HAppTy a (HieArgs args) ->
+    typeToNames a <> hieArgsTypes args
+
+  HTyConApp (IfaceTyCon{ifaceTyConName}) (HieArgs args) ->
+    Set.singleton ifaceTyConName <> hieArgsTypes args
+
+  HForAllTy _ a -> typeToNames a
+
+  HFunTy b c ->
+    typeToNames b <> typeToNames c
+
+  HQualTy a b ->
+    typeToNames a <> typeToNames b
+
+  HLitTy _ -> mempty
+
+  HCastTy a -> typeToNames a
+
+  HCoercionTy -> mempty
+
+  where
+
+    hieArgsTypes :: [(Bool, HieTypeFix)] -> Set Name
+    hieArgsTypes = foldMap (typeToNames . snd) . filter fst
+
+lookupType :: MonadReader AnalysisInfo m => TypeIndex -> m HieTypeFix
+lookupType t = recoverFullType t . hie_types <$> asks currentHieFile
 
 topLevelAnalysis :: MonadState Analysis m => HieAST a -> m ()
 topLevelAnalysis n@Node{ nodeChildren } = do
@@ -382,6 +455,26 @@ findIdentifiers f Node{ nodeInfo = NodeInfo{ nodeIdentifiers }, nodeChildren } =
 
        ( Map.toList nodeIdentifiers )
   <> foldMap ( findIdentifiers f ) nodeChildren
+
+findIdentifiers'
+  :: ( Set ContextInfo -> Bool )
+  -> HieAST a
+  -> Seq (Declaration, IdentifierDetails a, HieAST a)
+findIdentifiers' f n@Node{ nodeInfo = NodeInfo{ nodeIdentifiers }, nodeChildren } =
+     foldMap
+       (\case
+           ( Left _, _ ) ->
+             mempty
+
+           ( Right name, ids@IdentifierDetails{ identInfo } ) ->
+             if f identInfo then
+               (, ids, n) <$> foldMap pure (nameToDeclaration name)
+
+             else
+               mempty
+           )
+       ((Map.toList nodeIdentifiers))
+  <> foldMap ( findIdentifiers' f ) nodeChildren
 
 
 uses :: HieAST a -> Set Declaration
