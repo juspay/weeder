@@ -57,7 +57,7 @@ import FieldLabel ( FieldLbl( FieldLabel, flSelector ) )
 import HieTypes
   ( BindType( RegularBind )
   -- , EvVarSource ( EvInstBind, cls )
-  , ContextInfo( Decl, ValBind, PatternBind, Use, TyDecl, ClassTyDecl )
+  , ContextInfo( Decl, ValBind, PatternBind, Use, TyDecl, ClassTyDecl, RecField )
   , DeclType( DataDec, ClassDec, ConDec, SynDec, FamDec )
   , HieAST( Node, nodeInfo, nodeChildren, nodeSpan )
   , HieASTs( HieASTs, getAsts )
@@ -65,6 +65,7 @@ import HieTypes
   , IdentifierDetails( IdentifierDetails, identInfo )
   , NodeInfo( NodeInfo, nodeIdentifiers, nodeAnnotations )
   , Scope( ModuleScope )
+  , RecFieldContext ( RecFieldOcc )
   , IdentifierDetails( IdentifierDetails, identInfo, identType )
   , TypeIndex
   , HieTypeFix( Roll )
@@ -663,8 +664,17 @@ findIdentifiers' f n@Node{ nodeInfo = NodeInfo{ nodeIdentifiers }, nodeChildren 
 uses :: HieAST a -> Set Declaration
 uses =
     foldMap Set.singleton
-  . findIdentifiers \identInfo -> Use `Set.member` identInfo
+  . findIdentifiers (any isUse)
 
+isUse :: ContextInfo -> Bool
+isUse = \case
+  Use -> True
+  -- not RecFieldMatch and RecFieldDecl because they occur under
+  -- data declarations, which we do not want to add as dependencies
+  -- because that would make the graph no longer acyclic
+  -- RecFieldAssign will be most likely accompanied by the constructor
+  RecField RecFieldOcc _ -> True
+  _ -> False
 
 nameToDeclaration :: Name -> Maybe Declaration
 nameToDeclaration name = do
