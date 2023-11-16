@@ -145,7 +145,7 @@ mainWithConfig hieExt hieDirectories requireHsFiles weederConfig@Config{ rootPat
     reachableSet =
       reachable
         analysis
-        ( Set.map DeclarationRoot roots <> bool mempty ( Set.map DeclarationRoot ( implicitRoots analysis ) ) typeClassRoots )
+        ( Set.map DeclarationRoot roots <> bool mempty (( implicitRoots analysis ) ) typeClassRoots )
 
     dead =
       allDeclarations analysis Set.\\ reachableSet
@@ -168,6 +168,26 @@ mainWithConfig hieExt hieDirectories requireHsFiles weederConfig@Config{ rootPat
       putStrLn $ showWeed path start d
 
   unless ( null warnings ) exitFailure
+  -- where
+  --   filterImplicitRoots :: Analysis -> Set Root -> Set Root
+  --   filterImplicitRoots Analysis{ prettyPrintedType, modulePaths } = Set.filter $ \case
+  --     DeclarationRoot _ -> True -- keep implicit roots for rewrite rules etc
+
+  --     ModuleRoot _ -> True
+
+  --     InstanceRoot d c -> typeClassRoots || matchingClass || matchingType
+  --       where
+  --         matchingClass = any (maybe True (occNameString c =~)) (filterOnModule rootClasses)
+
+  --         matchingType = case Map.lookup d prettyPrintedType of
+  --           Just t -> any (maybe True (t =~)) (filterOnModule rootInstances)
+  --           Nothing -> False
+
+  --         filterOnModule :: Set PatternWithModule -> Set (Maybe String)
+  --         filterOnModule = Set.map mainPattern . Set.filter (maybe True modulePathMatches . modulePattern)
+
+  --         modulePathMatches :: String -> Bool
+  --         modulePathMatches p = maybe False (=~ p) (Map.lookup ( declModule d ) modulePaths)
 
 showWeed :: FilePath -> RealSrcLoc -> Declaration -> String
 showWeed path start d =
