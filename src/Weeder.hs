@@ -34,7 +34,7 @@ import Control.Applicative ( Alternative )
 import Control.Monad ( guard, msum, when, unless )
 import Data.Foldable ( for_, traverse_ )
 import Data.List ( intercalate )
-import Data.Monoid ( First( First ) )
+import Data.Monoid ( First( First ), getFirst )
 import GHC.Generics ( Generic )
 import Prelude hiding ( span )
 
@@ -46,6 +46,7 @@ import Data.Set ( Set )
 import qualified Data.Set as Set
 import Data.Tree (Tree)
 import qualified Data.Tree as Tree
+import Data.Traversable ( for )
 
 -- generic-lens
 import Data.Generics.Labels ()
@@ -482,22 +483,43 @@ analyseClassDeclaration n@Node{ nodeInfo = NodeInfo{ nodeAnnotations } } = do
         _ ->
           False
 
+analyseDataDeclaration :: ( Alternative m, MonadState Analysis m, MonadReader AnalysisInfo m ) => HieAST TypeIndex -> m ()
+analyseDataDeclaration n = do
+  guard $ annsContain n ("DataDecl", "TyClDecl")
 
-analyseDataDeclaration :: ( Alternative m, MonadState Analysis m ) => HieAST a -> m ()
-analyseDataDeclaration n@Node { nodeInfo = NodeInfo{ nodeAnnotations } } = do
-  guard ( ( "DataDecl", "TyClDecl" ) `Set.member` nodeAnnotations )
+  Config{ unusedTypes } <- asks weederConfig
 
   for_
     ( foldMap
         ( First . Just )
         ( findIdentifiers ( any isDataDec ) n )
     )
-    \dataTypeName ->
-      for_ ( constructors n ) \constructor ->
-        for_ ( foldMap ( First . Just ) ( findIdentifiers ( any isConDec ) constructor ) ) \conDec -> do
-          addDependency conDec dataTypeName
+    \dataTypeName -> do
+      when unusedTypes $
+        define dataTypeName (nodeSpan n)
 
-          for_ ( uses constructor ) ( addDependency conDec )
+      -- Without connecting constructors to the data declaration TypeAliasGADT.hs 
+      -- fails with a false positive for A
+      conDecs <- for ( constructors n ) \constructor ->
+        for ( foldMap ( First . Just ) ( findIdentifiers ( any isConDec ) constructor ) ) \conDec -> do
+          addDependency conDec dataTypeName
+          pure conDec
+
+      -- To keep acyclicity in record declarations
+      let isDependent d = Just d `elem` fmap getFirst conDecs
+
+      for_ ( uses n ) (\d -> unless (isDependent d) $ addDependency dataTypeName d)
+
+  for_ ( derivedInstances n ) \(d, cs, ids, ast) -> do
+    define d (nodeSpan ast)
+
+    -- followEvidenceUses ast d
+
+    for_ ( uses ast ) $ addDependency d
+
+    case identType ids of
+      Just t -> for_ cs (addInstanceRoot d t)
+      Nothing -> pure ()
 
   where
 
@@ -508,6 +530,43 @@ analyseDataDeclaration n@Node { nodeInfo = NodeInfo{ nodeAnnotations } } = do
     isConDec = \case
       Decl ConDec _ -> True
       _             -> False
+
+derivedInstances :: HieAST a -> Seq (Declaration, Set Name, IdentifierDetails a, HieAST a)
+derivedInstances n = findNodeTypes "HsDerivingClause" n >>= findEvInstBinds
+
+
+findNodeTypes :: FastString.FastString -> HieAST a -> Seq ( HieAST a )
+findNodeTypes name n@Node{ nodeChildren,  nodeInfo = NodeInfo{ nodeAnnotations } } =
+  if any ( \( _, t ) -> t == name ) nodeAnnotations then
+    pure n
+
+  else
+    foldMap (findNodeTypes name) nodeChildren
+
+-- constructors n@Node { nodeChildren, nodeInfo = NodeInfo{ nodeAnnotations } } =
+--   if any ( \( _, t ) -> t == "ConDecl" ) nodeAnnotations then
+--     pure n
+
+--   else
+--     foldMap constructors nodeChildren
+
+findEvInstBinds :: HieAST a -> Seq (Declaration, Set Name, IdentifierDetails a, HieAST a)
+findEvInstBinds n = (\(d, ids, ast) -> (d, getClassNames ids, ids, ast)) <$>
+  findIdentifiers'
+    (   not
+      . Set.null
+    ) n
+
+  where
+
+    -- getEvVarSources :: Set ContextInfo -> Set EvVarSource
+    -- getEvVarSources = foldMap (maybe mempty Set.singleton) .
+    --   Set.map \case
+    --     -- EvidenceVarBind a@EvInstBind{} ModuleScope _ -> Just a
+    --     _ -> Nothing
+
+    getClassNames :: IdentifierDetails a -> Set Name
+    getClassNames a = Set.empty
 
 
 constructors :: HieAST a -> Seq ( HieAST a )
