@@ -1,7 +1,7 @@
 {
   inputs = {
-    # nixpkgs.url = "github:nixos/nixpkgs/2e87d165f74411ae00f964a508945696969ff53d";
-    nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
+    nixpkgs.url = "github:nixos/nixpkgs/43e3b6af08f29c4447a6073e3d5b86a4f45dd420";
+    # nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
     haskell-flake.url = "github:srid/haskell-flake";
     flake-parts.url = "github:hercules-ci/flake-parts";
     systems.url = "github:nix-systems/default";
